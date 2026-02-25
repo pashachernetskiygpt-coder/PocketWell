@@ -8,6 +8,8 @@ from PyQt5.QtWidgets import (
 )
 from PyQt5.QtCore import Qt, QTimer
 
+RAW_AZIMUTH_ROLE = Qt.UserRole + 1
+
 logger = logging.getLogger("WellApp.trajectory")
 
 
@@ -92,7 +94,9 @@ class TrajectoryTab(QWidget):
         self.table.insertRow(row)
         self.table.setItem(row, 0, QTableWidgetItem(str(0.0)))
         self.table.setItem(row, 1, QTableWidgetItem(str(0.0)))
-        self.table.setItem(row, 2, QTableWidgetItem(str(0.0)))
+        azim_item = QTableWidgetItem(str(0.0))
+        azim_item.setData(RAW_AZIMUTH_ROLE, 0.0)
+        self.table.setItem(row, 2, azim_item)
         self.table.setItem(row, 3, QTableWidgetItem(""))
         self.table.blockSignals(False)
         logger.debug("Добавлена точка траектории, всего строк: %s", self.table.rowCount())
@@ -108,11 +112,85 @@ class TrajectoryTab(QWidget):
         if column == 3:
             # столбец TVD — только для вывода
             return
+
+        # В колонке азимута пользователь редактирует базовое значение.
+        # Если в этот момент задана поправка, в ячейке отображается уже
+        # скорректированное число — поэтому raw восстанавливаем как
+        # (введённый_текст - текущая_поправка).
+        if column == 2:
+            azim_item = self.table.item(row, 2)
+            if azim_item is not None:
+                try:
+                    shown_azim = float((azim_item.text() or "").replace(",", "."))
+                    corr = float((self.azimcorr_edit.text() or "0").replace(",", "."))
+                    raw_azim = shown_azim - corr
+                    while raw_azim >= 360.0:
+                        raw_azim -= 360.0
+                    while raw_azim < 0.0:
+                        raw_azim += 360.0
+                    azim_item.setData(RAW_AZIMUTH_ROLE, raw_azim)
+                except Exception:
+                    pass
+
         if self._handling_traj_change:
             return
         self._handling_traj_change = True
         QTimer.singleShot(0, self.update_tvd)
         self._handling_traj_change = False
+
+    def _parse_azimuth_correction(self) -> float:
+        try:
+            return float(self.azimcorr_edit.text().replace(",", "."))
+        except Exception:
+            logger.warning(
+                "update_tvd: некорректная поправка азимута '%s', принята 0.0",
+                self.azimcorr_edit.text(),
+            )
+            return 0.0
+
+    def _get_or_init_raw_azimuth(self, row: int) -> float | None:
+        azim_item = self.table.item(row, 2)
+        if azim_item is None:
+            return None
+
+        raw_azim = azim_item.data(RAW_AZIMUTH_ROLE)
+        if raw_azim is None:
+            try:
+                raw_azim = float((azim_item.text() or "").replace(",", "."))
+                azim_item.setData(RAW_AZIMUTH_ROLE, raw_azim)
+            except Exception:
+                return None
+
+        try:
+            return float(raw_azim)
+        except Exception:
+            return None
+
+    @staticmethod
+    def _normalize_deg(deg: float) -> float:
+        while deg >= 360.0:
+            deg -= 360.0
+        while deg < 0.0:
+            deg += 360.0
+        return deg
+
+    def _refresh_azimuth_display(self, azim_corr: float):
+        """
+        Обновляет отображаемый азимут во всех строках: raw + поправка.
+        Raw хранится отдельно в item.data(RAW_AZIMUTH_ROLE).
+        """
+        for row in range(self.table.rowCount()):
+            raw = self._get_or_init_raw_azimuth(row)
+            if raw is None:
+                continue
+            corrected = self._normalize_deg(raw + azim_corr)
+
+            azim_item = self.table.item(row, 2)
+            if azim_item is None:
+                azim_item = QTableWidgetItem()
+                self.table.setItem(row, 2, azim_item)
+                azim_item.setData(RAW_AZIMUTH_ROLE, raw)
+            azim_item.setText(f"{corrected:.2f}")
 
     def update_tvd(self):
         """
@@ -128,47 +206,37 @@ class TrajectoryTab(QWidget):
                                self.altitude_edit.text())
                 altitude = 0.0
 
-            # читаем поправку азимута
-            try:
-                azim_corr = float(self.azimcorr_edit.text().replace(",", "."))
-            except Exception:
-                logger.warning("update_tvd: некорректная поправка азимута '%s', принята 0.0",
-                               self.azimcorr_edit.text())
-                azim_corr = 0.0
+            azim_corr = self._parse_azimuth_correction()
+
+            # Важно: сначала обновляем отображение азимута во всех строках,
+            # затем считаем TVD.
+            self.table.blockSignals(True)
+            self._refresh_azimuth_display(azim_corr)
 
             points = []
             for row in range(self.table.rowCount()):
                 try:
                     md_item = self.table.item(row, 0)
                     incl_item = self.table.item(row, 1)
-                    azim_item = self.table.item(row, 2)
-                    if not md_item or not incl_item or not azim_item:
+                    if not md_item or not incl_item:
                         points.append(None)
                         continue
 
                     md = float(md_item.text().replace(",", "."))
                     incl = float(incl_item.text().replace(",", "."))
-                    azim = float(azim_item.text().replace(",", "."))
-                    # применяем поправку
-                    azim_corrected = azim + azim_corr
-                    while azim_corrected >= 360.0:
-                        azim_corrected -= 360.0
-                    while azim_corrected < 0.0:
-                        azim_corrected += 360.0
-                    points.append((md, incl, azim_corrected))
+                    points.append((md, incl))
                 except Exception:
                     points.append(None)
 
             tvd = altitude   # начинаем с альтитуды
             md_prev = 0.0
 
-            self.table.blockSignals(True)
             for row, p in enumerate(points):
                 if p is None:
                     self.table.setItem(row, 3, QTableWidgetItem(""))
                     continue
 
-                md, incl, azim_corr_val = p
+                md, incl = p
                 delta_md = md - md_prev
                 # прибавляем приращение
                 tvd += delta_md * math.cos(math.radians(incl))
@@ -178,11 +246,6 @@ class TrajectoryTab(QWidget):
                 tvd_item.setFlags(Qt.ItemIsSelectable | Qt.ItemIsEnabled)
                 self.table.setItem(row, 3, tvd_item)
 
-                # обновляем ячейку азимута с поправкой
-                azim_item = self.table.item(row, 2)
-                if azim_item:
-                    azim_item.setText(f"{azim_corr_val:.2f}")
-
             self.table.blockSignals(False)
 
             # 🔑 Автоматическое обновление во вкладке "Равновесие"
@@ -191,6 +254,13 @@ class TrajectoryTab(QWidget):
                     self.balance_tab.update_tvd_display()
                 except Exception:
                     logger.exception("update_tvd: ошибка при обновлении BalanceTab")
+
+            # 🔑 Автоматическое обновление во вкладке "Отдувка"
+            if getattr(self, "displacement_tab", None):
+                try:
+                    self.displacement_tab.update_tvd_display()
+                except Exception:
+                    logger.exception("update_tvd: ошибка при обновлении DisplacementTab")
 
         except Exception:
             logger.exception("update_tvd: необработанная ошибка")
@@ -258,7 +328,9 @@ class TrajectoryTab(QWidget):
             self.table.insertRow(row)
             self.table.setItem(row, 0, QTableWidgetItem(str(md)))
             self.table.setItem(row, 1, QTableWidgetItem(str(incl)))
-            self.table.setItem(row, 2, QTableWidgetItem(str(azim)))
+            azim_item = QTableWidgetItem(str(azim))
+            azim_item.setData(RAW_AZIMUTH_ROLE, azim)
+            self.table.setItem(row, 2, azim_item)
             self.table.setItem(row, 3, QTableWidgetItem(""))
 
         self.table.blockSignals(False)
