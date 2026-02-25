@@ -149,7 +149,9 @@ class TrajectoryTab(QWidget):
                     md = float(md_item.text().replace(",", "."))
                     incl = float(incl_item.text().replace(",", "."))
                     azim = float(azim_item.text().replace(",", "."))
-                    # применяем поправку
+                    # применяем поправку ТОЛЬКО для расчёта,
+                    # исходное значение в таблице не перезаписываем,
+                    # чтобы поправка не "накапливалась" при каждом пересчёте.
                     azim_corrected = azim + azim_corr
                     while azim_corrected >= 360.0:
                         azim_corrected -= 360.0
@@ -178,11 +180,6 @@ class TrajectoryTab(QWidget):
                 tvd_item.setFlags(Qt.ItemIsSelectable | Qt.ItemIsEnabled)
                 self.table.setItem(row, 3, tvd_item)
 
-                # обновляем ячейку азимута с поправкой
-                azim_item = self.table.item(row, 2)
-                if azim_item:
-                    azim_item.setText(f"{azim_corr_val:.2f}")
-
             self.table.blockSignals(False)
 
             # 🔑 Автоматическое обновление во вкладке "Равновесие"
@@ -191,6 +188,13 @@ class TrajectoryTab(QWidget):
                     self.balance_tab.update_tvd_display()
                 except Exception:
                     logger.exception("update_tvd: ошибка при обновлении BalanceTab")
+
+            # 🔑 Автоматическое обновление во вкладке "Отдувка"
+            if getattr(self, "displacement_tab", None):
+                try:
+                    self.displacement_tab.update_tvd_display()
+                except Exception:
+                    logger.exception("update_tvd: ошибка при обновлении DisplacementTab")
 
         except Exception:
             logger.exception("update_tvd: необработанная ошибка")
